@@ -348,6 +348,36 @@ export const DesktopUpdateCheckResultSchema = Schema.Struct({
   state: DesktopUpdateStateSchema,
 });
 
+export const LocalForkUpdateStatusSchema = Schema.Literals([
+  "idle",
+  "starting",
+  "fetching",
+  "merging",
+  "blocked",
+  "conflict",
+  "building",
+  "installing",
+  "complete",
+  "error",
+]);
+export type LocalForkUpdateStatus = typeof LocalForkUpdateStatusSchema.Type;
+
+export interface LocalForkUpdateState {
+  status: LocalForkUpdateStatus;
+  message: string;
+  conflicts: ReadonlyArray<string>;
+  pid: number | null;
+  updatedAt: string | null;
+}
+
+export const LocalForkUpdateStateSchema = Schema.Struct({
+  status: LocalForkUpdateStatusSchema,
+  message: Schema.String,
+  conflicts: Schema.Array(Schema.String),
+  pid: Schema.NullOr(Schema.Number),
+  updatedAt: Schema.NullOr(Schema.String),
+});
+
 // Stable id for the Windows-native primary backend. Desktop side wraps
 // this with a brand inside DesktopBackendManager; web side keeps it as
 // a plain string so the env-runtime can compare against it without
@@ -1242,6 +1272,10 @@ export interface DesktopBridge {
   downloadUpdate: () => Promise<DesktopUpdateActionResult>;
   installUpdate: () => Promise<DesktopUpdateActionResult>;
   onUpdateState: (listener: (state: DesktopUpdateState) => void) => () => void;
+  /** Local source sync/build flow for a user's personal fork. */
+  getLocalForkUpdateState?: (repoPath: string) => Promise<LocalForkUpdateState>;
+  startLocalForkUpdate?: (repoPath: string) => Promise<LocalForkUpdateState>;
+  revealLocalForkUpdateFolder?: (repoPath: string) => Promise<boolean>;
   /** Present when the desktop shell accepts `t3 app` activation requests. */
   appActivation?: {
     setReady: (ready: boolean) => Promise<void>;

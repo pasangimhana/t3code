@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type BackgroundActivityProfile,
   type DesktopUpdateChannel,
+  type LocalForkUpdateState,
   ProviderDriverKind,
   type ProviderInstanceId,
   type ScopedThreadRef,
@@ -280,10 +281,147 @@ function AboutVersionSection() {
   const updateState = useDesktopUpdateState();
   const [isChangingUpdateChannel, setIsChangingUpdateChannel] = useState(false);
   const [isUpdateActionPending, setIsUpdateActionPending] = useState(false);
+  const [isLocalForkUpdatePending, setIsLocalForkUpdatePending] = useState(false);
+  const [localForkUpdateState, setLocalForkUpdateState] = useState<LocalForkUpdateState | null>(
+    null,
+  );
+  const [localForkUpdateRefreshKey, setLocalForkUpdateRefreshKey] = useState(0);
+  const [localForkPath, setLocalForkPath] = useLocalStorage(
+    "t3code:local-fork-update-source",
+    "",
+    Schema.String,
+  );
 
   const hasDesktopBridge = typeof window !== "undefined" && Boolean(window.desktopBridge);
+  const localForkUpdaterSupported =
+    hasDesktopBridge &&
+    typeof window.desktopBridge?.getLocalForkUpdateState === "function" &&
+    typeof window.desktopBridge?.startLocalForkUpdate === "function";
+  const localForkUpdaterConfigured = localForkUpdaterSupported && localForkPath.trim().length > 0;
+  const localForkUpdateIsActive =
+    localForkUpdateState !== null &&
+    ["starting", "fetching", "merging", "building", "installing"].includes(
+      localForkUpdateState.status,
+    );
   const selectedUpdateChannel = updateState?.channel ?? "latest";
   const selectedHostedAppChannel = hasDesktopBridge ? null : HOSTED_APP_CHANNEL;
+
+  useEffect(() => {
+    const bridge = window.desktopBridge;
+    if (!localForkUpdaterConfigured || !bridge?.getLocalForkUpdateState) {
+      setLocalForkUpdateState(null);
+      return;
+    }
+
+    let cancelled = false;
+    let timeout: number | undefined;
+    const readState = async () => {
+      try {
+        const state = await bridge.getLocalForkUpdateState!(localForkPath.trim());
+        if (cancelled) return;
+        setLocalForkUpdateState(state);
+        if (["starting", "fetching", "merging", "building", "installing"].includes(state.status)) {
+          timeout = window.setTimeout(() => void readState(), 800);
+        }
+      } catch (error) {
+        if (cancelled) return;
+        setLocalForkUpdateState({
+          status: "error",
+          message: error instanceof Error ? error.message : "Could not read local update status.",
+          conflicts: [],
+          pid: null,
+          updatedAt: null,
+        });
+      }
+    };
+
+    void readState();
+    return () => {
+      cancelled = true;
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    };
+  }, [localForkPath, localForkUpdateRefreshKey, localForkUpdaterConfigured]);
+
+  const handleChooseLocalForkFolder = useCallback(async () => {
+    try {
+      const folder = await window.desktopBridge?.pickFolder({
+        initialPath: localForkPath.trim() || null,
+      });
+      if (folder) {
+        setLocalForkPath(folder);
+        setLocalForkUpdateState(null);
+        setLocalForkUpdateRefreshKey((value) => value + 1);
+      }
+    } catch (error) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not choose fork folder",
+          description: error instanceof Error ? error.message : "Folder selection failed.",
+        }),
+      );
+    }
+  }, [localForkPath, setLocalForkPath]);
+
+  const handleStartLocalForkUpdate = useCallback(async () => {
+    const bridge = window.desktopBridge;
+    if (!bridge?.startLocalForkUpdate || !localForkPath.trim()) return;
+    let confirmed = false;
+    try {
+      confirmed = await ensureLocalApi().dialogs.confirm(
+        "T3 Code will fetch upstream changes, merge them into your local main, build a new app, then quit and restart. The app will stop and show any conflicts for you to resolve. Continue?",
+      );
+    } catch (error) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not confirm local update",
+          description: error instanceof Error ? error.message : "Update confirmation failed.",
+        }),
+      );
+      return;
+    }
+    if (!confirmed) return;
+    setIsLocalForkUpdatePending(true);
+    try {
+      setLocalForkUpdateState(await bridge.startLocalForkUpdate(localForkPath.trim()));
+      setLocalForkUpdateRefreshKey((value) => value + 1);
+    } catch (error) {
+      setLocalForkUpdateState({
+        status: "error",
+        message: error instanceof Error ? error.message : "Could not start the local updater.",
+        conflicts: [],
+        pid: null,
+        updatedAt: null,
+      });
+    } finally {
+      setIsLocalForkUpdatePending(false);
+    }
+  }, [localForkPath]);
+
+  const handleRevealLocalForkFolder = useCallback(async () => {
+    const reveal = window.desktopBridge?.revealLocalForkUpdateFolder;
+    if (!reveal || !localForkPath.trim()) return;
+    try {
+      const opened = await reveal(localForkPath.trim());
+      if (opened) return;
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not open fork folder",
+          description: "Check that the selected checkout still exists.",
+        }),
+      );
+    } catch (error) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not open fork folder",
+          description: error instanceof Error ? error.message : "Folder could not be opened.",
+        }),
+      );
+    }
+  }, [localForkPath]);
 
   const handleUpdateChannelChange = useCallback(
     (channel: DesktopUpdateChannel) => {
@@ -318,6 +456,11 @@ function AboutVersionSection() {
   const handleButtonClick = useCallback(async () => {
     const bridge = window.desktopBridge;
     if (!bridge) return;
+
+    if (localForkUpdaterConfigured) {
+      await handleStartLocalForkUpdate();
+      return;
+    }
 
     const action = updateState ? resolveDesktopUpdateButtonAction(updateState) : "none";
 
@@ -398,12 +541,17 @@ function AboutVersionSection() {
           }),
         );
       });
-  }, [isUpdateActionPending, updateState]);
+  }, [handleStartLocalForkUpdate, isUpdateActionPending, localForkUpdaterConfigured, updateState]);
 
   const action = updateState ? resolveDesktopUpdateButtonAction(updateState) : "none";
-  const buttonTooltip = updateState ? getDesktopUpdateButtonTooltip(updateState) : null;
-  const buttonDisabled =
-    action === "none"
+  const buttonTooltip = localForkUpdaterConfigured
+    ? "Fetch upstream changes, build your fork, and replace this app."
+    : updateState
+      ? getDesktopUpdateButtonTooltip(updateState)
+      : null;
+  const buttonDisabled = localForkUpdaterConfigured
+    ? localForkUpdateIsActive || isLocalForkUpdatePending
+    : action === "none"
       ? !canCheckForUpdate(updateState)
       : isDesktopUpdateButtonDisabled(updateState);
 
@@ -413,10 +561,29 @@ function AboutVersionSection() {
     downloading: "Downloading…",
     "up-to-date": "Up to Date",
   };
-  const buttonLabel =
-    actionLabel[action] ?? statusLabel[updateState?.status ?? ""] ?? "Check for Updates";
-  const description =
-    action === "download" || action === "install"
+  const localForkUpdateButtonLabel = localForkUpdateIsActive
+    ? localForkUpdateState?.status === "fetching"
+      ? "Fetching…"
+      : localForkUpdateState?.status === "merging"
+        ? "Merging…"
+        : localForkUpdateState?.status === "building"
+          ? "Building…"
+          : localForkUpdateState?.status === "installing"
+            ? "Installing…"
+            : "Starting…"
+    : localForkUpdateState?.status === "blocked" ||
+        localForkUpdateState?.status === "conflict" ||
+        localForkUpdateState?.status === "error"
+      ? "Retry Sync"
+      : "Sync & Install";
+  const buttonLabel = localForkUpdaterConfigured
+    ? localForkUpdateButtonLabel
+    : (actionLabel[action] ?? statusLabel[updateState?.status ?? ""] ?? "Check for Updates");
+  const description = localForkUpdaterConfigured
+    ? localForkUpdateState && localForkUpdateState.status !== "idle"
+      ? localForkUpdateState.message
+      : "Sync upstream changes, build your local fork, and install it without publishing a release."
+    : action === "download" || action === "install"
       ? "Update available."
       : "Current version of the application.";
 
@@ -443,7 +610,87 @@ function AboutVersionSection() {
           </Tooltip>
         }
       />
-      {hasDesktopBridge ? (
+      {localForkUpdaterSupported ? (
+        <SettingsRow
+          title="Local fork source"
+          description="Choose the local T3 Code checkout to sync, build, and install."
+          control={
+            <div className="flex items-center gap-2">
+              {localForkPath ? (
+                <Button
+                  size="sm"
+                  variant="ghost-muted"
+                  disabled={localForkUpdateIsActive || isLocalForkUpdatePending}
+                  onClick={() => setLocalForkPath("")}
+                >
+                  Clear
+                </Button>
+              ) : null}
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={localForkUpdateIsActive || isLocalForkUpdatePending}
+                onClick={() => void handleChooseLocalForkFolder()}
+              >
+                Choose Folder
+              </Button>
+            </div>
+          }
+        >
+          {localForkPath ? (
+            <code className="block max-w-full truncate pb-2 text-xs text-muted-foreground">
+              {localForkPath}
+            </code>
+          ) : (
+            <p className="pb-2 text-xs text-muted-foreground">No local fork folder selected.</p>
+          )}
+        </SettingsRow>
+      ) : null}
+      {localForkUpdaterConfigured &&
+      localForkUpdateState &&
+      localForkUpdateState.status !== "idle" ? (
+        <SettingsRow
+          title={
+            localForkUpdateState.status === "conflict"
+              ? "Upstream merge needs attention"
+              : localForkUpdateState.status === "blocked"
+                ? "Local changes need attention"
+                : localForkUpdateState.status === "error"
+                  ? "Local update failed"
+                  : localForkUpdateState.status === "complete"
+                    ? "Fork updated"
+                    : "Local fork update"
+          }
+          description={localForkUpdateState.message}
+          control={
+            <div className="flex items-center gap-2">
+              {localForkUpdateIsActive ? <Spinner /> : null}
+              {localForkUpdateState.status === "conflict" ||
+              localForkUpdateState.status === "blocked" ||
+              localForkUpdateState.status === "error" ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void handleRevealLocalForkFolder()}
+                >
+                  Open Folder
+                </Button>
+              ) : null}
+            </div>
+          }
+        >
+          {localForkUpdateState.conflicts.length > 0 ? (
+            <ul className="space-y-1 pb-2 pl-4 text-xs text-muted-foreground">
+              {localForkUpdateState.conflicts.map((conflict) => (
+                <li key={conflict} className="list-disc break-all">
+                  {conflict}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </SettingsRow>
+      ) : null}
+      {hasDesktopBridge && !localForkUpdaterConfigured ? (
         <SettingsRow
           title="Update track"
           description="Use stable releases or nightly builds. Switch back anytime."

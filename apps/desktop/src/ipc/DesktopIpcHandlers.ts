@@ -37,6 +37,11 @@ import {
   setUpdateChannel,
 } from "./methods/updates.ts";
 import {
+  getLocalForkUpdateState,
+  revealLocalForkUpdateFolder,
+  startLocalForkUpdate,
+} from "./methods/localForkUpdates.ts";
+import {
   getAppBranding,
   getLocalEnvironmentBootstraps,
   getLocalEnvironmentBearerToken,
@@ -140,6 +145,9 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(downloadUpdate);
   yield* ipc.handle(installUpdate);
   yield* ipc.handle(checkForUpdate);
+  yield* ipc.handle(getLocalForkUpdateState);
+  yield* ipc.handle(startLocalForkUpdate);
+  yield* ipc.handle(revealLocalForkUpdateFolder);
   for (const previewMethod of PreviewIpc.methods) {
     yield* ipc.handle(previewMethod);
   }

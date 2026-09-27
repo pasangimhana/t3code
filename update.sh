@@ -4,10 +4,51 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_root"
 
+write_status() {
+  local status="$1"
+  local message="$2"
+  local conflicts="${3:-}"
+  mkdir -p "$repo_root/.t3"
+  node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const [root, status, message, conflictText, pid] = process.argv.slice(1);
+    const file = path.join(root, ".t3", "local-update-status.json");
+    const payload = {
+      status,
+      message,
+      conflicts: conflictText ? conflictText.split(/\r?\n/).filter(Boolean) : [],
+      pid: Number(pid) || null,
+      updatedAt: new Date().toISOString(),
+    };
+    const temporary = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(payload));
+    fs.renameSync(temporary, file);
+  ' "$repo_root" "$status" "$message" "$conflicts" "$$"
+}
+
+record_unexpected_failure() {
+  local exit_code="$?"
+  [[ "$exit_code" -eq 0 ]] && return
+  local current_status
+  current_status="$(node -e 'try { process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).status) } catch {}' "$repo_root/.t3/local-update-status.json" 2>/dev/null || true)"
+  case "$current_status" in
+    blocked|conflict|error) return ;;
+  esac
+  write_status error "The updater exited unexpectedly (code $exit_code). Retry to run it again." || true
+}
+trap record_unexpected_failure EXIT
+
 fail() {
-  printf 'update.sh: %s\n' "$1" >&2
+  local message="$1"
+  local status="${2:-error}"
+  local conflicts="${3:-}"
+  write_status "$status" "$message" "$conflicts" || true
+  printf 'update.sh: %s\n' "$message" >&2
   exit 1
 }
+
+write_status starting "Preparing the local fork update."
 
 [[ "$(uname -s)" == "Darwin" ]] || fail "This installer currently supports macOS only."
 
@@ -17,20 +58,32 @@ case "$(uname -m)" in
   *) fail "Unsupported Mac architecture: $(uname -m)" ;;
 esac
 
-[[ "$(git branch --show-current)" == "main" ]] || fail "Switch to the local main branch before updating."
-[[ -z "$(git status --porcelain --untracked-files=all)" ]] ||
-  fail "Commit or stash local changes before updating."
+[[ "$(git branch --show-current)" == "main" ]] || fail "Switch to the local main branch before updating." blocked
+if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+  unmerged_paths="$(git diff --name-only --diff-filter=U)"
+  if [[ -n "$unmerged_paths" ]]; then
+    fail "Resolve and commit the upstream merge before retrying." conflict "$unmerged_paths"
+  fi
+  dirty_paths="$( { git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard; } | sort -u )"
+  fail "Commit or stash local changes before updating." blocked "$dirty_paths"
+fi
 
 upstream_remote="${T3CODE_UPSTREAM_REMOTE:-origin}"
 upstream_branch="${T3CODE_UPSTREAM_BRANCH:-main}"
 git remote get-url "$upstream_remote" >/dev/null 2>&1 ||
   fail "Git remote '$upstream_remote' was not found."
 
+write_status fetching "Fetching $upstream_remote/$upstream_branch."
 printf 'Fetching %s/%s...\n' "$upstream_remote" "$upstream_branch"
 git fetch "$upstream_remote" "+refs/heads/$upstream_branch:refs/remotes/$upstream_remote/$upstream_branch"
 
+write_status merging "Merging upstream changes into local main."
 if ! git merge --no-edit "$upstream_remote/$upstream_branch"; then
-  fail "Upstream changes conflicted. Resolve them on main, commit the merge, then rerun."
+  conflict_paths="$(git diff --name-only --diff-filter=U)"
+  if [[ -n "$conflict_paths" ]]; then
+    fail "Resolve and commit the upstream merge before retrying." conflict "$conflict_paths"
+  fi
+  fail "Could not merge upstream changes into local main." error
 fi
 
 rust_toolchain="${T3CODE_RUST_TOOLCHAIN:-1.95.0}"
@@ -43,6 +96,7 @@ build_dir="$repo_root/.t3/local-updates/$build_version"
 mkdir -p "$build_dir"
 
 printf 'Building %s for macOS %s...\n' "$build_version" "$build_arch"
+write_status building "Building T3 Code $build_version for macOS $build_arch."
 RUSTUP_TOOLCHAIN="$rust_toolchain" \
   T3CODE_DESKTOP_UPDATE_REPOSITORY="pasangimhana/t3code" \
   node scripts/build-desktop-artifact.ts \
@@ -54,6 +108,7 @@ RUSTUP_TOOLCHAIN="$rust_toolchain" \
 
 dmg_path="$build_dir/T3-Code-$build_version-$build_arch.dmg"
 [[ -f "$dmg_path" ]] || fail "Build completed without producing $dmg_path."
+write_status installing "Preparing the app installation."
 
 app_path="/Applications/T3 Code (Alpha).app"
 mount_path="$build_dir/mounted"
@@ -100,6 +155,7 @@ if pgrep -x "T3 Code (Alpha)" >/dev/null 2>&1; then
 fi
 
 if [[ -e "$app_path" ]]; then
+  write_status installing "Installing the build and restarting T3 Code."
   backup_dir="$repo_root/.t3/fork-backups"
   mkdir -p "$backup_dir"
   backup_path="$backup_dir/T3Code-Alpha-before-$build_version.app"
@@ -113,6 +169,7 @@ fi
 
 open -a "$app_path"
 installed_version="$(defaults read "$app_path/Contents/Info" CFBundleShortVersionString)"
+write_status complete "Installed T3 Code $installed_version from local main."
 printf 'Installed T3 Code %s from local main.\n' "$installed_version"
 printf 'The app uses the existing T3 Code data directory. Run ./update.sh to sync and rebuild again.\n'
 [[ -z "$backup_path" ]] || printf 'Previous app backup: %s\n' "$backup_path"

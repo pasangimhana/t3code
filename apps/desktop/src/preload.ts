@@ -251,6 +251,12 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   checkForUpdate: () => ipcRenderer.invoke(IpcChannels.UPDATE_CHECK_CHANNEL),
   downloadUpdate: () => ipcRenderer.invoke(IpcChannels.UPDATE_DOWNLOAD_CHANNEL),
   installUpdate: () => ipcRenderer.invoke(IpcChannels.UPDATE_INSTALL_CHANNEL),
+  getLocalForkUpdateState: (repoPath) =>
+    ipcRenderer.invoke(IpcChannels.LOCAL_FORK_UPDATE_GET_STATE_CHANNEL, repoPath),
+  startLocalForkUpdate: (repoPath) =>
+    ipcRenderer.invoke(IpcChannels.LOCAL_FORK_UPDATE_START_CHANNEL, repoPath),
+  revealLocalForkUpdateFolder: (repoPath) =>
+    ipcRenderer.invoke(IpcChannels.LOCAL_FORK_UPDATE_REVEAL_FOLDER_CHANNEL, repoPath),
   onUpdateState: (listener) => {
     const wrappedListener = (_event: Electron.IpcRendererEvent, state: unknown) => {
       if (typeof state !== "object" || state === null) return;

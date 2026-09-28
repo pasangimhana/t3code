@@ -5177,24 +5177,43 @@ export default function Sidebar() {
                           items.push(
                             <SortableSidebarProjectItem key={item.key} item={item}>
                               {project ? (
-                                <button
-                                  type="button"
-                                  aria-label={`${item.title} project`}
-                                  aria-expanded={item.expanded}
-                                  data-thread-selection-safe
-                                  onClick={() => toggleProjectGroup(item.projectKey)}
-                                  className="flex h-8 w-full cursor-pointer items-center gap-2 rounded-md px-2.5 text-left text-sm font-medium text-sidebar-foreground/85 hover:bg-sidebar-row-hover"
-                                >
-                                  <ProjectFavicon project={project} className="size-4 shrink-0" />
-                                  <span className="min-w-0 flex-1 truncate">{item.title}</span>
-                                  <ChevronDownIcon
-                                    aria-hidden
-                                    className={cn(
-                                      "size-3 shrink-0 text-sidebar-muted-foreground transition-transform",
-                                      !item.expanded && "-rotate-90",
-                                    )}
-                                  />
-                                </button>
+                                <div className="flex h-8 w-full items-center gap-1 rounded-md px-2.5 text-sm font-medium text-sidebar-foreground/85 hover:bg-sidebar-row-hover">
+                                  <button
+                                    type="button"
+                                    aria-label={`${item.title} project`}
+                                    aria-expanded={item.expanded}
+                                    data-thread-selection-safe
+                                    onClick={() => toggleProjectGroup(item.projectKey)}
+                                    className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+                                  >
+                                    <ProjectFavicon project={project} className="size-4 shrink-0" />
+                                    <span className="min-w-0 flex-1 truncate">{item.title}</span>
+                                    <ChevronDownIcon
+                                      aria-hidden
+                                      className={cn(
+                                        "size-3 shrink-0 text-sidebar-muted-foreground transition-transform",
+                                        !item.expanded && "-rotate-90",
+                                      )}
+                                    />
+                                  </button>
+                                  <Button
+                                    type="button"
+                                    size="icon-xs"
+                                    variant="ghost-muted"
+                                    aria-label={`New thread in ${item.title}`}
+                                    title={`New thread in ${item.title}`}
+                                    data-thread-selection-safe
+                                    onPointerDown={(event) => event.stopPropagation()}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void handleNewThreadRef.current(
+                                        scopeProjectRef(project.environmentId, project.id),
+                                      );
+                                    }}
+                                  >
+                                    <PlusIcon aria-hidden className="size-3.5" />
+                                  </Button>
+                                </div>
                               ) : (
                                 <div
                                   role="heading"

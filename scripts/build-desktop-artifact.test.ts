@@ -29,6 +29,7 @@ import {
   LINUX_BROWSER_SECRET_EXTRA_RESOURCES,
   LINUX_FILE_EXCLUSIONS,
   MAC_FILE_EXCLUSIONS,
+  InvalidDesktopProfileError,
   InvalidMacPasskeyRpDomainError,
   InvalidMacPasskeyPublishableKeyError,
   InvalidMockUpdateServerPortError,
@@ -278,6 +279,24 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       macIconPng: BRAND_ASSET_PATHS.nightlyMacIconPng,
       linuxIconPng: BRAND_ASSET_PATHS.nightlyLinuxIconPng,
       windowsIconIco: BRAND_ASSET_PATHS.nightlyWindowsIconIco,
+    });
+  });
+
+  it("uses profile product names and macOS artwork for profiled builds", () => {
+    assert.equal(resolveDesktopProductName("0.0.17", "personal"), "T3 Code Personal");
+    assert.equal(resolveDesktopProductName("0.0.17", "work"), "T3 Code Work");
+    // A profile branding wins over the nightly display name too.
+    assert.equal(resolveDesktopProductName("0.0.17-nightly.20260413.42", "work"), "T3 Code Work");
+
+    assert.deepStrictEqual(resolveDesktopBuildIconAssets("0.0.17", "personal"), {
+      macIconPng: BRAND_ASSET_PATHS.profilePersonalMacIconPng,
+      linuxIconPng: BRAND_ASSET_PATHS.productionLinuxIconPng,
+      windowsIconIco: BRAND_ASSET_PATHS.productionWindowsIconIco,
+    });
+    assert.deepStrictEqual(resolveDesktopBuildIconAssets("0.0.17", "work"), {
+      macIconPng: BRAND_ASSET_PATHS.profileWorkMacIconPng,
+      linuxIconPng: BRAND_ASSET_PATHS.productionLinuxIconPng,
+      windowsIconIco: BRAND_ASSET_PATHS.productionWindowsIconIco,
     });
   });
 
@@ -693,6 +712,63 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         assert.deepStrictEqual(config.electronLanguages, DESKTOP_ELECTRON_LANGUAGES);
       }
       assert.deepStrictEqual(mac.electronLanguages, DESKTOP_ELECTRON_LANGUAGES);
+    }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
+  );
+
+  it.effect("packages profiled macOS builds under their own bundle identity", () =>
+    Effect.gen(function* () {
+      const personal = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "1.2.3",
+        false,
+        false,
+        undefined,
+        undefined,
+        false,
+        "arm64",
+        "personal",
+      );
+      const work = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "1.2.3",
+        false,
+        false,
+        undefined,
+        undefined,
+        false,
+        "arm64",
+        "work",
+      );
+
+      assert.equal(personal.appId, "com.t3tools.t3code");
+      assert.equal(personal.productName, "T3 Code Personal");
+      assert.equal(personal.artifactName, "T3-Code-Personal-${version}-${arch}.${ext}");
+      assert.deepStrictEqual((personal.mac as Record<string, unknown>).protocols, [
+        { name: "T3 Code", schemes: ["t3code", "t3code-dev"] },
+      ]);
+
+      assert.equal(work.appId, "com.t3tools.t3code.work");
+      assert.equal(work.productName, "T3 Code Work");
+      assert.equal(work.artifactName, "T3-Code-Work-${version}-${arch}.${ext}");
+      assert.deepStrictEqual((work.mac as Record<string, unknown>).protocols, [
+        { name: "T3 Code", schemes: ["t3code-work"] },
+      ]);
+      assert.equal((work.dmg as Record<string, unknown>).title, "T3 Code Work 1.2.3 Installer");
+
+      const defaultProfile = yield* createBuildConfig(
+        "mac",
+        "dmg",
+        "1.2.3",
+        false,
+        false,
+        undefined,
+        undefined,
+      );
+      assert.equal(defaultProfile.appId, "com.t3tools.t3code");
+      assert.equal(defaultProfile.productName, "T3 Code (Alpha)");
+      assert.equal(defaultProfile.artifactName, "T3-Code-${version}-${arch}.${ext}");
     }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
 
@@ -2180,6 +2256,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         mockUpdates: Option.none(),
         mockUpdateServerPort: Option.none(),
         wslRuntime: Option.none(),
+        profile: Option.none(),
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -2220,6 +2297,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
             mockUpdates: Option.none(),
             mockUpdateServerPort: Option.none(),
             wslRuntime: Option.none(),
+            profile: Option.none(),
           }),
         );
 
@@ -2244,6 +2322,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         mockUpdates: Option.some(false),
         mockUpdateServerPort: Option.none(),
         wslRuntime: Option.none(),
+        profile: Option.none(),
       }).pipe(
         Effect.provide(
           ConfigProvider.layer(
@@ -2265,6 +2344,55 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.equal(resolved.signed, false);
       assert.equal(resolved.verbose, false);
       assert.equal(resolved.mockUpdates, false);
+    }),
+  );
+
+  it.effect("resolves desktop build profiles from flags and environment", () =>
+    Effect.gen(function* () {
+      const baseInput = {
+        platform: Option.some("mac" as const),
+        target: Option.none(),
+        arch: Option.some("arm64" as const),
+        buildVersion: Option.none(),
+        outputDir: Option.none(),
+        skipBuild: Option.none(),
+        keepStage: Option.none(),
+        signed: Option.none(),
+        verbose: Option.none(),
+        mockUpdates: Option.none(),
+        mockUpdateServerPort: Option.none(),
+        wslRuntime: Option.none(),
+      };
+
+      const fromFlag = yield* resolveBuildOptions({
+        ...baseInput,
+        profile: Option.some("personal, work"),
+      }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))));
+      assert.deepStrictEqual(fromFlag.profiles, ["personal", "work"]);
+
+      const fromEnv = yield* resolveBuildOptions({
+        ...baseInput,
+        profile: Option.none(),
+      }).pipe(
+        Effect.provide(
+          ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_DESKTOP_PROFILE: "work" } })),
+        ),
+      );
+      assert.deepStrictEqual(fromEnv.profiles, ["work"]);
+
+      const none = yield* resolveBuildOptions({
+        ...baseInput,
+        profile: Option.none(),
+      }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))));
+      assert.deepStrictEqual(none.profiles, []);
+
+      const error = yield* Effect.flip(
+        resolveBuildOptions({
+          ...baseInput,
+          profile: Option.some("team"),
+        }),
+      ).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))));
+      assert.instanceOf(error, InvalidDesktopProfileError);
     }),
   );
 });

@@ -96,7 +96,7 @@ build_dir="$repo_root/.t3/local-updates/$build_version"
 mkdir -p "$build_dir"
 
 printf 'Building %s for macOS %s...\n' "$build_version" "$build_arch"
-write_status building "Building T3 Code $build_version for macOS $build_arch."
+write_status building "Building T3 Code Personal and T3 Code Work $build_version for macOS $build_arch."
 RUSTUP_TOOLCHAIN="$rust_toolchain" \
   T3CODE_DESKTOP_UPDATE_REPOSITORY="pasangimhana/t3code" \
   node scripts/build-desktop-artifact.ts \
@@ -104,72 +104,173 @@ RUSTUP_TOOLCHAIN="$rust_toolchain" \
     --target dmg \
     --arch "$build_arch" \
     --build-version "$build_version" \
+    --profile personal,work \
     --output-dir "$build_dir"
 
-dmg_path="$build_dir/T3-Code-$build_version-$build_arch.dmg"
-[[ -f "$dmg_path" ]] || fail "Build completed without producing $dmg_path."
-write_status installing "Preparing the app installation."
+personal_dmg="$build_dir/T3-Code-Personal-$build_version-$build_arch.dmg"
+work_dmg="$build_dir/T3-Code-Work-$build_version-$build_arch.dmg"
+[[ -f "$personal_dmg" ]] || fail "Build completed without producing $personal_dmg."
+[[ -f "$work_dmg" ]] || fail "Build completed without producing $work_dmg."
+write_status installing "Preparing the app installations."
 
-app_path="/Applications/T3 Code (Alpha).app"
-mount_path="$build_dir/mounted"
-staged_app="/Applications/.T3 Code (Alpha).app-update-$$"
-backup_path=""
-mounted=0
+personal_app="/Applications/T3 Code Personal.app"
+work_app="/Applications/T3 Code Work.app"
+legacy_app="/Applications/T3 Code (Alpha).app"
+backup_dir="$repo_root/.t3/fork-backups"
+mkdir -p "$backup_dir"
+
+# Cleanup state is newline-delimited rather than arrays: the desktop updater
+# spawns this script through /bin/bash, which is still 3.2 on macOS.
+cleanup_mounts=""
+cleanup_staged=""
+cleanup_backups=""
 
 cleanup() {
-  if [[ "$mounted" == "1" ]]; then
-    hdiutil detach "$mount_path" -quiet >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$backup_path" && ! -e "$app_path" && -e "$backup_path" ]]; then
-    mv "$backup_path" "$app_path" || true
-  fi
-  if [[ -e "$staged_app" ]]; then
-    rm -rf "$staged_app"
-  fi
+  local mount_point staged_path restore_entry restore_target restore_backup
+  while IFS= read -r mount_point; do
+    [[ -n "$mount_point" ]] || continue
+    hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true
+  done <<< "$cleanup_mounts"
+  while IFS= read -r staged_path; do
+    [[ -n "$staged_path" ]] || continue
+    if [[ -e "$staged_path" ]]; then
+      rm -rf "$staged_path"
+    fi
+  done <<< "$cleanup_staged"
+  while IFS= read -r restore_entry; do
+    [[ -n "$restore_entry" ]] || continue
+    restore_target="${restore_entry%%|*}"
+    restore_backup="${restore_entry#*|}"
+    if [[ ! -e "$restore_target" && -e "$restore_backup" ]]; then
+      mv "$restore_backup" "$restore_target" || true
+    fi
+  done <<< "$cleanup_backups"
 }
 trap cleanup EXIT
 
-mkdir -p "$mount_path"
-hdiutil attach -readonly -nobrowse -mountpoint "$mount_path" "$dmg_path" >/dev/null
-mounted=1
+app_is_running() {
+  # pgrep treats its pattern as an extended regex, so the legacy app's
+  # parentheses must be escaped before an exact-name match.
+  local pattern
+  pattern="$(printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g')"
+  pgrep -x "$pattern" >/dev/null 2>&1
+}
 
-source_app="$(find "$mount_path" -maxdepth 1 -type d -name '*.app' -print -quit)"
-[[ -n "$source_app" ]] || fail "The built DMG contains no app bundle."
-[[ "$(defaults read "$source_app/Contents/Info" CFBundleIdentifier)" == "com.t3tools.t3code" ]] ||
-  fail "The built app has an unexpected bundle identifier."
-[[ ! -e "$source_app/Contents/Resources/app-update.yml" ]] ||
-  fail "The local preview build unexpectedly contains an auto-update feed."
-
-ditto "$source_app" "$staged_app"
-hdiutil detach "$mount_path" -quiet
-mounted=0
-
-if pgrep -x "T3 Code (Alpha)" >/dev/null 2>&1; then
-  osascript -e 'tell application id "com.t3tools.t3code" to quit' >/dev/null 2>&1 || true
-  for _ in {1..30}; do
-    pgrep -x "T3 Code (Alpha)" >/dev/null 2>&1 || break
+quit_app() {
+  local app_name="$1"
+  local bundle_id="$2"
+  app_is_running "$app_name" || return 0
+  osascript -e "tell application id \"$bundle_id\" to quit" >/dev/null 2>&1 || true
+  local attempt
+  for attempt in {1..30}; do
+    app_is_running "$app_name" || return 0
     sleep 1
   done
-  pgrep -x "T3 Code (Alpha)" >/dev/null 2>&1 &&
-    fail "T3 Code is still open. Quit it and run update.sh again."
+  fail "$app_name is still open. Quit it and run update.sh again."
+}
+
+last_backup_path=""
+
+# Mount the DMG, ditto the app into a staging path in /Applications, verify the
+# extracted bundle while the DMG is still attached, then swap it into place.
+# The previous app is kept as a backup until the next update.
+install_app() {
+  local app_name="$1"
+  local dmg_path="$2"
+  local app_path="$3"
+  local expected_bundle_id="$4"
+  local mount_path="$build_dir/mounted-$app_name"
+  local staged_app="/Applications/.$app_name.app-update-$$"
+  local source_app
+  local backup_path
+
+  last_backup_path=""
+
+  mkdir -p "$mount_path"
+  hdiutil attach -readonly -nobrowse -mountpoint "$mount_path" "$dmg_path" >/dev/null
+  cleanup_mounts="${cleanup_mounts}${mount_path}"$'\n'
+
+  source_app="$(find "$mount_path" -maxdepth 1 -type d -name '*.app' -print -quit)"
+  [[ -n "$source_app" ]] || fail "The $app_name build contains no app bundle."
+
+  rm -rf "$staged_app"
+  ditto "$source_app" "$staged_app"
+  cleanup_staged="${cleanup_staged}${staged_app}"$'\n'
+
+  [[ "$(defaults read "$staged_app/Contents/Info" CFBundleIdentifier)" == "$expected_bundle_id" ]] ||
+    fail "The $app_name build has an unexpected bundle identifier."
+  [[ ! -e "$staged_app/Contents/Resources/app-update.yml" ]] ||
+    fail "The local preview build for $app_name unexpectedly contains an auto-update feed."
+
+  hdiutil detach "$mount_path" -quiet
+
+  if [[ -e "$app_path" ]]; then
+    backup_path="$backup_dir/$app_name-before-$build_version.app"
+    mv "$app_path" "$backup_path"
+    last_backup_path="$backup_path"
+    cleanup_backups="${cleanup_backups}${app_path}|${backup_path}"$'\n'
+  fi
+
+  if ! mv "$staged_app" "$app_path"; then
+    if [[ -n "$last_backup_path" ]]; then
+      mv "$last_backup_path" "$app_path"
+      last_backup_path=""
+    fi
+    fail "Could not install the new $app_name app; the previous app was restored."
+  fi
+}
+
+personal_was_running=0
+work_was_running=0
+legacy_was_running=0
+if app_is_running "T3 Code Personal"; then personal_was_running=1; fi
+if app_is_running "T3 Code Work"; then work_was_running=1; fi
+if app_is_running "T3 Code (Alpha)"; then legacy_was_running=1; fi
+
+# The legacy app shares the personal bundle identifier, so it must be quit
+# before the personal app is replaced; a running legacy app counts as a running
+# personal app for the relaunch.
+if [[ "$legacy_was_running" == "1" ]]; then
+  quit_app "T3 Code (Alpha)" "com.t3tools.t3code"
+fi
+if [[ "$personal_was_running" == "1" ]]; then
+  quit_app "T3 Code Personal" "com.t3tools.t3code"
+fi
+if [[ "$work_was_running" == "1" ]]; then
+  quit_app "T3 Code Work" "com.t3tools.t3code.work"
 fi
 
-if [[ -e "$app_path" ]]; then
-  write_status installing "Installing the build and restarting T3 Code."
-  backup_dir="$repo_root/.t3/fork-backups"
-  mkdir -p "$backup_dir"
-  backup_path="$backup_dir/T3Code-Alpha-before-$build_version.app"
-  mv "$app_path" "$backup_path"
+if [[ "$legacy_was_running" == "1" || "$personal_was_running" == "1" || "$work_was_running" == "1" ]]; then
+  write_status installing "Installing the builds and restarting T3 Code."
+else
+  write_status installing "Installing the builds."
 fi
 
-if ! mv "$staged_app" "$app_path"; then
-  [[ -z "$backup_path" ]] || mv "$backup_path" "$app_path"
-  fail "Could not install the new app; the previous app was restored."
+install_app "T3 Code Personal" "$personal_dmg" "$personal_app" "com.t3tools.t3code"
+personal_backup="$last_backup_path"
+install_app "T3 Code Work" "$work_dmg" "$work_app" "com.t3tools.t3code.work"
+work_backup="$last_backup_path"
+
+# Migration only after both installs succeed: the legacy app is never deleted,
+# it moves into the same backup directory as the replaced profile apps.
+legacy_backup=""
+if [[ -e "$legacy_app" ]]; then
+  legacy_backup="$backup_dir/T3Code-Alpha-before-$build_version.app"
+  mv "$legacy_app" "$legacy_backup"
 fi
 
-open -a "$app_path"
-installed_version="$(defaults read "$app_path/Contents/Info" CFBundleShortVersionString)"
-write_status complete "Installed T3 Code $installed_version from local main."
-printf 'Installed T3 Code %s from local main.\n' "$installed_version"
-printf 'The app uses the existing T3 Code data directory. Run ./update.sh to sync and rebuild again.\n'
-[[ -z "$backup_path" ]] || printf 'Previous app backup: %s\n' "$backup_path"
+if [[ "$legacy_was_running" == "1" || "$personal_was_running" == "1" ]]; then
+  open -a "$personal_app"
+fi
+if [[ "$work_was_running" == "1" ]]; then
+  open -a "$work_app"
+fi
+
+personal_version="$(defaults read "$personal_app/Contents/Info" CFBundleShortVersionString)"
+work_version="$(defaults read "$work_app/Contents/Info" CFBundleShortVersionString)"
+write_status complete "Installed T3 Code Personal $personal_version and T3 Code Work $work_version from local main."
+printf 'Installed T3 Code Personal %s and T3 Code Work %s from local main.\n' "$personal_version" "$work_version"
+printf 'The Personal app keeps using the existing T3 Code data directory; the Work app uses its own. Run ./update.sh to sync and rebuild again.\n'
+[[ -z "$personal_backup" ]] || printf 'Previous Personal app backup: %s\n' "$personal_backup"
+[[ -z "$work_backup" ]] || printf 'Previous Work app backup: %s\n' "$work_backup"
+[[ -z "$legacy_backup" ]] || printf 'Legacy T3 Code (Alpha) app moved to: %s\n' "$legacy_backup"

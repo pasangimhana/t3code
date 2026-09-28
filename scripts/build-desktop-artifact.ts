@@ -57,6 +57,62 @@ const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
 const DESKTOP_APP_ID = "com.t3tools.t3code";
 const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 
+interface DesktopProfileConfig {
+  readonly productName: string;
+  readonly appId: string;
+  readonly packageName: string;
+  readonly macIconPng: string;
+  readonly artifactLabel: string;
+  readonly protocolSchemes: ReadonlyArray<string>;
+}
+
+// Local fork builds that ship as separate side-by-side macOS apps. The personal
+// profile deliberately repeats every upstream identity (bundle id, package
+// name) so an existing install keeps its data, keychain, and TCC grants.
+const DESKTOP_PROFILES = {
+  personal: {
+    productName: "T3 Code Personal",
+    appId: "com.t3tools.t3code",
+    packageName: "t3code",
+    macIconPng: BRAND_ASSET_PATHS.profilePersonalMacIconPng,
+    artifactLabel: "T3-Code-Personal",
+    protocolSchemes: ["t3code", "t3code-dev"],
+  },
+  work: {
+    productName: "T3 Code Work",
+    appId: "com.t3tools.t3code.work",
+    packageName: "t3code-work",
+    macIconPng: BRAND_ASSET_PATHS.profileWorkMacIconPng,
+    artifactLabel: "T3-Code-Work",
+    protocolSchemes: ["t3code-work"],
+  },
+} as const satisfies Record<string, DesktopProfileConfig>;
+
+export type DesktopProfile = keyof typeof DESKTOP_PROFILES;
+
+const isDesktopProfile = (value: string): value is DesktopProfile =>
+  value === "personal" || value === "work";
+
+const resolveDesktopProfiles = Effect.fn("resolveDesktopProfiles")(function* (
+  configured: string | undefined,
+) {
+  const trimmed = configured?.trim() ?? "";
+  if (trimmed.length === 0) {
+    return [] as ReadonlyArray<DesktopProfile>;
+  }
+
+  const profiles: DesktopProfile[] = [];
+  for (const name of trimmed.split(",")) {
+    const entry = name.trim();
+    if (entry.length === 0) continue;
+    if (!isDesktopProfile(entry)) {
+      return yield* new InvalidDesktopProfileError({ profile: entry });
+    }
+    if (!profiles.includes(entry)) profiles.push(entry);
+  }
+  return profiles;
+});
+
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
 const BuildArch = Schema.Literals(["arm64", "x64", "universal"]);
 
@@ -162,6 +218,7 @@ interface BuildCliInput {
   readonly mockUpdates: Option.Option<boolean>;
   readonly mockUpdateServerPort: Option.Option<number>;
   readonly wslRuntime: Option.Option<string>;
+  readonly profile: Option.Option<string>;
 }
 
 function detectHostBuildPlatform(hostPlatform: string): typeof BuildPlatform.Type | undefined {
@@ -252,6 +309,17 @@ export class UnsupportedDesktopBuildArchitectureError extends Schema.TaggedError
 ) {
   override get message(): string {
     return `Unsupported architecture '${this.arch}' for ${this.platform}.`;
+  }
+}
+
+export class InvalidDesktopProfileError extends Schema.TaggedError<InvalidDesktopProfileError>()(
+  "InvalidDesktopProfileError",
+  {
+    profile: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Unknown desktop profile '${this.profile}'. Valid profiles: ${Object.keys(DESKTOP_PROFILES).join(", ")}.`;
   }
 }
 
@@ -919,6 +987,7 @@ interface ResolvedBuildOptions {
   readonly mockUpdates: boolean;
   readonly mockUpdateServerPort: number | undefined;
   readonly wslRuntime: string | undefined;
+  readonly profiles: ReadonlyArray<DesktopProfile>;
 }
 
 interface StagePackageJson {
@@ -926,6 +995,7 @@ interface StagePackageJson {
   readonly version: string;
   readonly buildVersion: string;
   readonly t3codeCommitHash: string;
+  readonly t3codeProfile?: DesktopProfile;
   readonly private: true;
   readonly packageManager: string;
   readonly description: string;
@@ -1226,6 +1296,7 @@ function normalizePasskeyRpDomain(value: string): string {
 
 export function resolveMacPasskeySigningConfiguration(
   env: Readonly<Record<string, string | undefined>>,
+  appId: string = DESKTOP_APP_ID,
 ): MacPasskeySigningConfiguration {
   const teamId = env.T3CODE_APPLE_TEAM_ID?.trim().toUpperCase() ?? "";
   if (!APPLE_TEAM_ID_PATTERN.test(teamId)) {
@@ -1261,7 +1332,7 @@ export function resolveMacPasskeySigningConfiguration(
   }
 
   return {
-    appId: DESKTOP_APP_ID,
+    appId,
     teamId,
     rpDomains: uniqueRpDomains,
     provisioningProfilePath,
@@ -1554,6 +1625,7 @@ const BuildEnvConfig = Config.all({
   // by the build_linux_cli CI job. The Windows build embeds it verbatim as the
   // WSL runtime.
   wslRuntime: Config.String("T3CODE_DESKTOP_WSL_RUNTIME").pipe(Config.option),
+  profile: Config.String("T3CODE_DESKTOP_PROFILE").pipe(Config.option),
 });
 
 const MockUpdateServerPortSchema = Schema.NumberFromString.check(
@@ -1648,6 +1720,10 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
   const wslRuntime =
     Option.getOrUndefined(input.wslRuntime) ?? Option.getOrUndefined(env.wslRuntime);
 
+  const configuredProfile =
+    Option.getOrUndefined(input.profile)?.trim() || Option.getOrUndefined(env.profile);
+  const profiles = yield* resolveDesktopProfiles(configuredProfile);
+
   return {
     platform,
     target,
@@ -1661,6 +1737,7 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     mockUpdates,
     mockUpdateServerPort,
     wslRuntime,
+    profiles,
   } satisfies ResolvedBuildOptions;
 });
 
@@ -2479,6 +2556,38 @@ function stageWindowsIcons(stageResourcesDir: string, sourceIco: string) {
   });
 }
 
+// The prod-resources tree is copied before per-profile icon generation, so each
+// profile must refresh the packaged icon copies the runtime can resolve.
+function refreshStageProdResourceIcons(
+  platform: typeof BuildPlatform.Type,
+  stageResourcesDir: string,
+  stageProdResourcesDir: string,
+) {
+  return Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const iconFiles =
+      platform === "mac"
+        ? ["icon.icns", "icon.png"]
+        : platform === "linux"
+          ? ["icon.png"]
+          : ["icon.ico"];
+
+    for (const iconFile of iconFiles) {
+      yield* fs.copyFile(
+        path.join(stageResourcesDir, iconFile),
+        path.join(stageProdResourcesDir, iconFile),
+      );
+    }
+
+    if (platform === "linux") {
+      const iconsDir = path.join(stageProdResourcesDir, "icons");
+      yield* fs.remove(iconsDir, { recursive: true, force: true }).pipe(Effect.ignore);
+      yield* fs.copy(path.join(stageResourcesDir, "icons"), iconsDir);
+    }
+  });
+}
+
 function validateBundledClientAssets(clientDir: string) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -2580,20 +2689,27 @@ export function resolveDesktopWebAssetBrand(version: string): WebAssetBrand {
   return resolveWebAssetBrandForChannel(resolveDesktopUpdateChannel(version));
 }
 
-export function resolveDesktopBuildIconAssets(version: string): DesktopBuildIconAssets {
-  if (resolveDesktopUpdateChannel(version) === "nightly") {
-    return {
-      macIconPng: BRAND_ASSET_PATHS.nightlyMacIconPng,
-      linuxIconPng: BRAND_ASSET_PATHS.nightlyLinuxIconPng,
-      windowsIconIco: BRAND_ASSET_PATHS.nightlyWindowsIconIco,
-    };
-  }
+export function resolveDesktopBuildIconAssets(
+  version: string,
+  profile?: DesktopProfile,
+): DesktopBuildIconAssets {
+  const channelAssets: DesktopBuildIconAssets =
+    resolveDesktopUpdateChannel(version) === "nightly"
+      ? {
+          macIconPng: BRAND_ASSET_PATHS.nightlyMacIconPng,
+          linuxIconPng: BRAND_ASSET_PATHS.nightlyLinuxIconPng,
+          windowsIconIco: BRAND_ASSET_PATHS.nightlyWindowsIconIco,
+        }
+      : {
+          macIconPng: BRAND_ASSET_PATHS.productionMacIconPng,
+          linuxIconPng: BRAND_ASSET_PATHS.productionLinuxIconPng,
+          windowsIconIco: BRAND_ASSET_PATHS.productionWindowsIconIco,
+        };
 
-  return {
-    macIconPng: BRAND_ASSET_PATHS.productionMacIconPng,
-    linuxIconPng: BRAND_ASSET_PATHS.productionLinuxIconPng,
-    windowsIconIco: BRAND_ASSET_PATHS.productionWindowsIconIco,
-  };
+  // Profiles are macOS-only for now; other platforms keep the channel artwork.
+  return profile === undefined
+    ? channelAssets
+    : { ...channelAssets, macIconPng: DESKTOP_PROFILES[profile].macIconPng };
 }
 
 export function resolveMockUpdateServerUrl(mockUpdateServerPort: number | undefined): string {
@@ -2613,7 +2729,10 @@ export function resolvePackageManagerUserAgent(packageManager: string): string {
   return `${trimmed.slice(0, versionSeparator)}/${trimmed.slice(versionSeparator + 1)}`;
 }
 
-export function resolveDesktopProductName(version: string): string {
+export function resolveDesktopProductName(version: string, profile?: DesktopProfile): string {
+  if (profile !== undefined) {
+    return DESKTOP_PROFILES[profile].productName;
+  }
   return resolveDesktopUpdateChannel(version) === "nightly"
     ? "T3 Code (Nightly)"
     : (desktopPackageJson.productName ?? "T3 Code");
@@ -2637,11 +2756,16 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   // source file was never written fails the electron-builder step.
   wslRuntimeBundled = false,
   arch?: typeof BuildArch.Type,
+  profile?: DesktopProfile,
 ) {
+  const profileConfig = profile === undefined ? undefined : DESKTOP_PROFILES[profile];
   const buildConfig: Record<string, unknown> = {
-    appId: DESKTOP_APP_ID,
-    productName: resolveDesktopProductName(version),
-    artifactName: "T3-Code-${version}-${arch}.${ext}",
+    appId: profileConfig?.appId ?? DESKTOP_APP_ID,
+    productName: resolveDesktopProductName(version, profile),
+    artifactName:
+      profileConfig === undefined
+        ? "T3-Code-${version}-${arch}.${ext}"
+        : `${profileConfig.artifactLabel}-\${version}-\${arch}.\${ext}`,
     electronLanguages: [...DESKTOP_ELECTRON_LANGUAGES],
     files: [
       ...DESKTOP_FILE_EXCLUSIONS,
@@ -2697,7 +2821,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       protocols: [
         {
           name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
+          schemes: [...(profileConfig?.protocolSchemes ?? ["t3code", "t3code-dev"])],
         },
       ],
       ...(signed ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") } : {}),
@@ -2715,7 +2839,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       // Give the themed installer its own Finder volume name. Finder caches
       // DMG window backgrounds by volume name, so reusing a generic name can
       // make a newly built background look unchanged during testing.
-      title: `${resolveDesktopProductName(version)} ${version} Installer`,
+      title: `${resolveDesktopProductName(version, profile)} ${version} Installer`,
       background: `dmg/dmg-background-${updateChannel}.png`,
       window: {
         width: 640,
@@ -3424,7 +3548,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   });
 
   const appVersion = options.version ?? serverPackageJson.version;
-  const iconAssets = resolveDesktopBuildIconAssets(appVersion);
+  // No profile keeps the upstream pipeline; profiles stage the app once and
+  // repackage the same tree per profile.
+  const runProfiles: ReadonlyArray<DesktopProfile | undefined> =
+    options.profiles.length > 0 ? [...options.profiles] : [undefined];
   const commitHash = yield* resolveGitCommitHash(repoRoot);
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
   const stageRoot = yield* mkdir({
@@ -3597,48 +3724,33 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     verbose: options.verbose,
   });
 
-  yield* assertPlatformBuildResources(
-    options.platform,
-    stageResourcesDir,
-    {
-      macIconPng: path.join(repoRoot, iconAssets.macIconPng),
-      linuxIconPng: path.join(repoRoot, iconAssets.linuxIconPng),
-      windowsIconIco: path.join(repoRoot, iconAssets.windowsIconIco),
-    },
-    options.verbose,
-  );
-
   // electron-builder is filtering out stageResourcesDir directory in the AppImage for production
   const stageProdResourcesDir = path.join(stageAppDir, "apps/desktop/prod-resources");
   yield* fs.copy(stageResourcesDir, stageProdResourcesDir);
 
-  const configuredMacPasskeySigning =
-    options.platform === "mac" && options.signed
-      ? yield* Effect.try({
-          try: () => resolveMacPasskeySigningConfiguration(loadRepoEnv({ repoRoot })),
-          catch: MacPasskeySigningConfigurationResolutionError.fromCause,
-        })
-      : undefined;
-  const macPasskeySigning = configuredMacPasskeySigning
-    ? {
-        ...configuredMacPasskeySigning,
-        provisioningProfilePath: path.resolve(
-          repoRoot,
-          configuredMacPasskeySigning.provisioningProfilePath,
-        ),
+  // Clone builds are unsigned, but signed profile builds must carry their own
+  // app id through the passkey entitlements.
+  const resolveMacEntitlements = (profile: DesktopProfile | undefined) =>
+    Effect.gen(function* () {
+      if (options.platform !== "mac" || !options.signed) {
+        return undefined;
       }
-    : undefined;
-  const macEntitlementsPath = macPasskeySigning
-    ? path.join(stageAppDir, "entitlements.mac.plist")
-    : undefined;
-  if (macPasskeySigning && macEntitlementsPath) {
-    if (!(yield* fs.exists(macPasskeySigning.provisioningProfilePath))) {
-      return yield* new MacProvisioningProfileNotFoundError({
-        provisioningProfilePath: macPasskeySigning.provisioningProfilePath,
+      const configured = yield* Effect.try({
+        try: () =>
+          resolveMacPasskeySigningConfiguration(
+            loadRepoEnv({ repoRoot }),
+            profile === undefined ? DESKTOP_APP_ID : DESKTOP_PROFILES[profile].appId,
+          ),
+        catch: MacPasskeySigningConfigurationResolutionError.fromCause,
       });
-    }
-    yield* fs.writeFileString(macEntitlementsPath, renderMacPasskeyEntitlements(macPasskeySigning));
-  }
+      const provisioningProfilePath = path.resolve(repoRoot, configured.provisioningProfilePath);
+      if (!(yield* fs.exists(provisioningProfilePath))) {
+        return yield* new MacProvisioningProfileNotFoundError({ provisioningProfilePath });
+      }
+      const entitlementsPath = path.join(stageAppDir, "entitlements.mac.plist");
+      yield* fs.writeFileString(entitlementsPath, renderMacPasskeyEntitlements(configured));
+      return { entitlementsPath, provisioningProfilePath };
+    });
 
   // Windows splits dependencies per process: app.asar carries only the
   // desktop main-process externals, while the server bundle's externals live
@@ -3662,42 +3774,48 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     options.platform === "win"
       ? path.join(stageAppDir, WINDOWS_SERVER_RESOURCE_SOURCE_DIR, WINDOWS_SERVER_ASAR_RESOURCE)
       : undefined;
-  const stagePackageJson: StagePackageJson = {
-    name: "t3code",
-    version: appVersion,
-    buildVersion: appVersion,
-    t3codeCommitHash: commitHash,
-    private: true,
-    packageManager: rootPackageJson.packageManager,
-    description: "T3 Code desktop build",
-    // Required by the .deb control file.
-    homepage: "https://t3.codes",
-    author: "T3 Tools",
-    main: "apps/desktop/dist-electron/boot.cjs",
-    build: yield* createBuildConfig(
-      options.platform,
-      options.target,
-      appVersion,
-      options.signed,
-      options.mockUpdates,
-      options.mockUpdateServerPort,
-      macPasskeySigning && macEntitlementsPath
-        ? {
-            entitlementsPath: macEntitlementsPath,
-            provisioningProfilePath: macPasskeySigning.provisioningProfilePath,
-          }
-        : undefined,
-      bundlesWslRuntime({ platform: options.platform, runtimeArchivePath: options.wslRuntime }),
-      options.arch,
-    ),
-    dependencies: stageDependencies,
-    devDependencies: {
-      electron: electronVersion,
-    },
-  };
+  const writeStagePackageJson = (profile: DesktopProfile | undefined) =>
+    Effect.gen(function* () {
+      const macEntitlements = yield* resolveMacEntitlements(profile);
+      const profileConfig = profile === undefined ? undefined : DESKTOP_PROFILES[profile];
+      const stagePackageJson: StagePackageJson = {
+        name: profileConfig?.packageName ?? "t3code",
+        version: appVersion,
+        buildVersion: appVersion,
+        t3codeCommitHash: commitHash,
+        ...(profile === undefined ? {} : { t3codeProfile: profile }),
+        private: true,
+        packageManager: rootPackageJson.packageManager,
+        description: "T3 Code desktop build",
+        // Required by the .deb control file.
+        homepage: "https://t3.codes",
+        author: "T3 Tools",
+        main: "apps/desktop/dist-electron/boot.cjs",
+        build: yield* createBuildConfig(
+          options.platform,
+          options.target,
+          appVersion,
+          options.signed,
+          options.mockUpdates,
+          options.mockUpdateServerPort,
+          macEntitlements,
+          bundlesWslRuntime({ platform: options.platform, runtimeArchivePath: options.wslRuntime }),
+          options.arch,
+          profile,
+        ),
+        dependencies: stageDependencies,
+        devDependencies: {
+          electron: electronVersion,
+        },
+      };
+      const stagePackageJsonString = yield* encodeJsonString(stagePackageJson);
+      yield* fs.writeFileString(
+        path.join(stageAppDir, "package.json"),
+        `${stagePackageJsonString}\n`,
+      );
+    });
 
-  const stagePackageJsonString = yield* encodeJsonString(stagePackageJson);
-  yield* fs.writeFileString(path.join(stageAppDir, "package.json"), `${stagePackageJsonString}\n`);
+  yield* writeStagePackageJson(runProfiles[0]);
   const stageWorkspaceConfig = createStageWorkspaceConfig({
     platform: options.platform,
     arch: options.arch,
@@ -3800,95 +3918,121 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     buildEnv.DEBUG = [buildEnv.DEBUG, ...debugNamespaces].filter(Boolean).join(",");
   }
 
-  yield* Effect.log(
-    `[desktop-artifact] Building ${options.platform}/${options.target} (arch=${options.arch}, version=${appVersion})...`,
-  );
-  const builderArgs = [
-    "exec",
-    "--filter",
-    "@t3tools/desktop",
-    "--",
-    "electron-builder",
-    "--projectDir",
-    stageAppDir,
-    platformConfig.cliFlag,
-    `--${options.arch}`,
-    "--publish",
-    "never",
-  ];
-  const builderCommand = yield* resolveSpawnCommand("vp", builderArgs, { env: buildEnv });
-  yield* runCommand(
-    ChildProcess.make(builderCommand.command, builderCommand.args, {
-      cwd: repoRoot,
-      env: buildEnv,
-      shell: builderCommand.shell,
-    }),
-    {
-      label: `vp exec --filter @t3tools/desktop -- electron-builder --projectDir ${stageAppDir} ${platformConfig.cliFlag} --${options.arch} --publish never`,
-      verbose: options.verbose,
-    },
-  );
-
   const stageDistDir = path.join(stageAppDir, "dist");
-  if (!(yield* fs.exists(stageDistDir))) {
-    return yield* new DesktopBuildDistDirectoryMissingError({
-      distPath: stageDistDir,
-      platform: options.platform,
-      arch: options.arch,
-    });
-  }
 
-  // Prove the packaged bundle is self-contained by loading it the way the WSL
-  // backend does, rather than by reasoning about the emitted source.
-  //
-  // Static analysis kept getting this wrong here. Scanning for bare imports
-  // matched specifiers inside effect's JSDoc examples and inside ajv's runtime
-  // codegen template, and asserting that one sentinel package was inlined
-  // missed a build that inlined `effect` while leaving `yaml` external. Node's
-  // resolver has no such ambiguity: it either finds every import or it does not.
-  //
-  // Only Windows unpacks anything; macOS and Linux keep the whole tree inside
-  // the app asar. Windows validates and executes the separately packed server
-  // sidecar after electron-builder copies it into the final payload.
-  if (options.platform === "win") {
-    yield* validateWindowsPackagedPayload({
-      stageDistDir,
-      appExecutableName: `${resolveDesktopProductName(appVersion)}.exe`,
-      targetArch: options.arch,
-      appVersion,
-      expectWslRuntime: bundlesWslRuntime({
-        platform: options.platform,
-        runtimeArchivePath: options.wslRuntime,
+  for (const profile of runProfiles) {
+    yield* writeStagePackageJson(profile);
+    const iconAssets = resolveDesktopBuildIconAssets(appVersion, profile);
+    yield* assertPlatformBuildResources(
+      options.platform,
+      stageResourcesDir,
+      {
+        macIconPng: path.join(repoRoot, iconAssets.macIconPng),
+        linuxIconPng: path.join(repoRoot, iconAssets.linuxIconPng),
+        windowsIconIco: path.join(repoRoot, iconAssets.windowsIconIco),
+      },
+      options.verbose,
+    );
+    yield* refreshStageProdResourceIcons(
+      options.platform,
+      stageResourcesDir,
+      stageProdResourcesDir,
+    );
+
+    // electron-builder's output directory is not cleaned between runs, so the
+    // previous profile's artifacts must not leak into this profile's copy.
+    yield* fs.remove(stageDistDir, { recursive: true, force: true }).pipe(Effect.ignore);
+
+    const profileSuffix = profile === undefined ? "" : `, profile=${profile}`;
+    yield* Effect.log(
+      `[desktop-artifact] Building ${options.platform}/${options.target} (arch=${options.arch}, version=${appVersion}${profileSuffix})...`,
+    );
+    const builderArgs = [
+      "exec",
+      "--filter",
+      "@t3tools/desktop",
+      "--",
+      "electron-builder",
+      "--projectDir",
+      stageAppDir,
+      platformConfig.cliFlag,
+      `--${options.arch}`,
+      "--publish",
+      "never",
+    ];
+    const builderCommand = yield* resolveSpawnCommand("vp", builderArgs, { env: buildEnv });
+    yield* runCommand(
+      ChildProcess.make(builderCommand.command, builderCommand.args, {
+        cwd: repoRoot,
+        env: buildEnv,
+        shell: builderCommand.shell,
       }),
-      verbose: options.verbose,
-    });
+      {
+        label: `vp exec --filter @t3tools/desktop -- electron-builder --projectDir ${stageAppDir} ${platformConfig.cliFlag} --${options.arch} --publish never`,
+        verbose: options.verbose,
+      },
+    );
+
+    if (!(yield* fs.exists(stageDistDir))) {
+      return yield* new DesktopBuildDistDirectoryMissingError({
+        distPath: stageDistDir,
+        platform: options.platform,
+        arch: options.arch,
+      });
+    }
+
+    // Prove the packaged bundle is self-contained by loading it the way the WSL
+    // backend does, rather than by reasoning about the emitted source.
+    //
+    // Static analysis kept getting this wrong here. Scanning for bare imports
+    // matched specifiers inside effect's JSDoc examples and inside ajv's runtime
+    // codegen template, and asserting that one sentinel package was inlined
+    // missed a build that inlined `effect` while leaving `yaml` external. Node's
+    // resolver has no such ambiguity: it either finds every import or it does not.
+    //
+    // Only Windows unpacks anything; macOS and Linux keep the whole tree inside
+    // the app asar. Windows validates and executes the separately packed server
+    // sidecar after electron-builder copies it into the final payload.
+    if (options.platform === "win") {
+      yield* validateWindowsPackagedPayload({
+        stageDistDir,
+        appExecutableName: `${resolveDesktopProductName(appVersion, profile)}.exe`,
+        targetArch: options.arch,
+        appVersion,
+        expectWslRuntime: bundlesWslRuntime({
+          platform: options.platform,
+          runtimeArchivePath: options.wslRuntime,
+        }),
+        verbose: options.verbose,
+      });
+    }
+
+    const stageEntries = yield* fs.readDirectory(stageDistDir);
+    yield* fs.makeDirectory(options.outputDir, { recursive: true });
+
+    const copiedArtifacts: string[] = [];
+    for (const entry of stageEntries) {
+      const from = path.join(stageDistDir, entry);
+      const stat = yield* fs.stat(from).pipe(Effect.orElseSucceed(() => null));
+      if (!stat || stat.type !== "File") continue;
+
+      const to = path.join(options.outputDir, entry);
+      yield* fs.copyFile(from, to);
+      copiedArtifacts.push(to);
+    }
+
+    if (copiedArtifacts.length === 0) {
+      return yield* new DesktopBuildNoArtifactsProducedError({
+        distPath: stageDistDir,
+        platform: options.platform,
+        arch: options.arch,
+      });
+    }
+
+    yield* Effect.log("[desktop-artifact] Done. Artifacts:").pipe(
+      Effect.annotateLogs({ artifacts: copiedArtifacts }),
+    );
   }
-
-  const stageEntries = yield* fs.readDirectory(stageDistDir);
-  yield* fs.makeDirectory(options.outputDir, { recursive: true });
-
-  const copiedArtifacts: string[] = [];
-  for (const entry of stageEntries) {
-    const from = path.join(stageDistDir, entry);
-    const stat = yield* fs.stat(from).pipe(Effect.orElseSucceed(() => null));
-    if (!stat || stat.type !== "File") continue;
-
-    const to = path.join(options.outputDir, entry);
-    yield* fs.copyFile(from, to);
-    copiedArtifacts.push(to);
-  }
-
-  if (copiedArtifacts.length === 0) {
-    return yield* new DesktopBuildNoArtifactsProducedError({
-      distPath: stageDistDir,
-      platform: options.platform,
-      arch: options.arch,
-    });
-  }
-
-  yield* Effect.log("[desktop-artifact] Done. Artifacts:").pipe(
-    Effect.annotateLogs({ artifacts: copiedArtifacts }),
-  );
 });
 
 const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
@@ -3946,6 +4090,12 @@ const buildDesktopArtifactCli = Command.make("build-desktop-artifact", {
   wslRuntime: Flag.String("wsl-runtime").pipe(
     Flag.withDescription(
       "Path to the Linux CLI release archive (t3-<version>-linux-x64.tar.gz) to embed as the WSL runtime of a Windows build (env: T3CODE_DESKTOP_WSL_RUNTIME).",
+    ),
+    Flag.optional,
+  ),
+  profile: Flag.String("profile").pipe(
+    Flag.withDescription(
+      "Desktop profile(s) to package, comma-separated (personal,work) (env: T3CODE_DESKTOP_PROFILE).",
     ),
     Flag.optional,
   ),

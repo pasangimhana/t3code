@@ -8,12 +8,13 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Electron from "electron";
 
+import * as DesktopEnvironment from "../../app/DesktopEnvironment.ts";
 import * as IpcChannels from "../channels.ts";
 import * as DesktopIpc from "../DesktopIpc.ts";
 
 const idleState: LocalForkUpdateState = {
   status: "idle",
-  message: "Choose your local fork checkout to enable sync and install.",
+  message: "Choose your local fork checkout to sync and rebuild the Personal and Work apps.",
   conflicts: [],
   pid: null,
   updatedAt: null,
@@ -128,7 +129,10 @@ function getState(inputPath: string): LocalForkUpdateState {
   return state;
 }
 
-async function startUpdate(inputPath: string): Promise<LocalForkUpdateState> {
+async function startUpdate(
+  inputPath: string,
+  profile: DesktopEnvironment.DesktopProfile | undefined,
+): Promise<LocalForkUpdateState> {
   const root = resolveRepositoryPath(inputPath);
   const previous = readState(root);
   if (
@@ -153,7 +157,10 @@ async function startUpdate(inputPath: string): Promise<LocalForkUpdateState> {
     cwd: root,
     detached: true,
     stdio: "ignore",
-    env: NodeProcess.env,
+    env: {
+      ...NodeProcess.env,
+      ...(profile === undefined ? {} : { T3CODE_PROFILE: profile }),
+    },
   });
   activeRuns.add(root);
   child.once("spawn", () => {
@@ -206,8 +213,9 @@ export const startLocalForkUpdate = DesktopIpc.makeIpcMethod({
   payload: Schema.String,
   result: LocalForkUpdateStateSchema,
   handler: Effect.fn("desktop.ipc.localForkUpdates.start")(function* (repoPath) {
+    const environment = yield* DesktopEnvironment.DesktopEnvironment;
     return yield* Effect.tryPromise({
-      try: () => startUpdate(repoPath),
+      try: () => startUpdate(repoPath, environment.profile),
       catch: (cause) => new LocalForkUpdateOperationError({ operation: "start", cause }),
     });
   }),

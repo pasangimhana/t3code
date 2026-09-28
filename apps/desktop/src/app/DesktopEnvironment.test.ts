@@ -2,8 +2,10 @@ import * as NodePath from "@effect/platform-node/NodePath";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
@@ -166,6 +168,37 @@ describe("DesktopEnvironment", () => {
       assert.equal(development.stateDir, "/Users/alice/.t3/dev");
       assert.equal(production.stateDir, "/Users/alice/.t3/userdata");
     }),
+  );
+
+  it.effect("adopts the packaged work profile identity and separate state paths", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const appRoot = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-work-profile-" });
+      const packageJsonPath = path.join(appRoot, "package.json");
+      yield* fs.writeFileString(packageJsonPath, '{"name":"t3code-work","t3codeProfile":"work"}');
+
+      const work = yield* makeEnvironment({ isPackaged: true, appPath: appRoot });
+
+      assert.equal(work.profile, "work");
+      assert.equal(work.displayName, "T3 Code Work");
+      assert.equal(work.userDataDirName, "t3code-work");
+      assert.equal(work.legacyUserDataDirName, "T3 Code (Work)");
+      assert.equal(work.baseDir, "/Users/alice/.t3-work");
+      assert.equal(work.stateDir, "/Users/alice/.t3-work/userdata");
+
+      // An unrecognized marker must not move the existing install's paths.
+      yield* fs.writeFileString(packageJsonPath, '{"t3codeProfile":"team"}');
+      const unknown = yield* makeEnvironment({ isPackaged: true, appPath: appRoot });
+      assert.equal(unknown.profile, undefined);
+      assert.equal(unknown.userDataDirName, "t3code");
+      assert.equal(unknown.baseDir, "/Users/alice/.t3");
+
+      // Dev runs never pick up a packaged profile marker.
+      const unpackaged = yield* makeEnvironment({ isPackaged: false, appPath: appRoot });
+      assert.equal(unpackaged.profile, undefined);
+      assert.equal(unpackaged.baseDir, "/Users/alice/.t3");
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("uses a configured app user model id override", () =>

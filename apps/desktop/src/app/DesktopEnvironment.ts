@@ -1,22 +1,31 @@
+// @effect-diagnostics nodeBuiltinImport:off -- The packaged profile marker is read synchronously while the environment service is built.
 import type {
   DesktopAppBranding,
   DesktopAppStageLabel,
   DesktopRuntimeArch,
   DesktopRuntimeInfo,
 } from "@t3tools/contracts";
+import * as NodeFS from "node:fs";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
 import { resolveLinuxDesktopEntryName } from "./DesktopEarlyElectronStartup.ts";
-import { resolveDesktopBaseDir, resolveDesktopStateDir } from "./DesktopStatePaths.ts";
+import {
+  resolveDesktopBaseDir,
+  resolveDesktopStateDir,
+  type DesktopProfile,
+} from "./DesktopStatePaths.ts";
 import { isNightlyDesktopVersion } from "../updates/updateChannels.ts";
 import type { OtlpProtocol } from "@t3tools/shared/observability";
+
+export type { DesktopProfile };
 
 export interface MakeDesktopEnvironmentInput {
   readonly dirname: string;
@@ -86,6 +95,7 @@ export class DesktopEnvironment extends Context.Service<
     readonly linuxWmClass: string;
     readonly linuxApplicationsDir: string;
     readonly appImagePath: Option.Option<string>;
+    readonly profile: DesktopProfile | undefined;
     readonly userDataDirName: string;
     readonly legacyUserDataDirName: string;
     readonly defaultDesktopSettings: DesktopAppSettings.DesktopSettings;
@@ -96,6 +106,37 @@ export class DesktopEnvironment extends Context.Service<
 >()("@t3tools/desktop/app/DesktopEnvironment") {}
 
 const APP_BASE_NAME = "T3 Code";
+
+const DesktopProfilePackageMetadata = Schema.Struct({
+  t3codeProfile: Schema.optional(Schema.String),
+});
+const decodeDesktopProfilePackageMetadata = Schema.decodeUnknownSync(
+  Schema.fromJsonString(DesktopProfilePackageMetadata),
+);
+
+// Profiles are a local-fork packaging concept: the build writes `t3codeProfile`
+// into the staged package.json, and only packaged apps read it. Dev runs always
+// resolve to no profile, so worktree state is untouched.
+function resolveDesktopProfile(input: {
+  readonly isPackaged: boolean;
+  readonly packageJsonPath: string;
+}): DesktopProfile | undefined {
+  if (!input.isPackaged) {
+    return undefined;
+  }
+
+  try {
+    const metadata = decodeDesktopProfilePackageMetadata(
+      // Electron patches fs so this works for a package.json inside app.asar.
+      NodeFS.readFileSync(input.packageJsonPath, "utf8"),
+    );
+    return metadata.t3codeProfile === "personal" || metadata.t3codeProfile === "work"
+      ? metadata.t3codeProfile
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function resolveDesktopAppStageLabel(input: {
   readonly isDevelopment: boolean;
@@ -111,8 +152,23 @@ function resolveDesktopAppStageLabel(input: {
 export function resolveDesktopAppBranding(input: {
   readonly isDevelopment: boolean;
   readonly appVersion: string;
+  readonly profile?: DesktopProfile;
 }): DesktopAppBranding {
   const stageLabel = resolveDesktopAppStageLabel(input);
+  if (input.profile === "personal") {
+    return {
+      baseName: APP_BASE_NAME,
+      stageLabel,
+      displayName: "T3 Code Personal",
+    };
+  }
+  if (input.profile === "work") {
+    return {
+      baseName: APP_BASE_NAME,
+      stageLabel,
+      displayName: "T3 Code Work",
+    };
+  }
   return {
     baseName: APP_BASE_NAME,
     stageLabel,
@@ -166,13 +222,18 @@ const make = Effect.fn("desktop.environment.make")(function* (
       : input.platform === "darwin"
         ? path.join(homeDirectory, "Library", "Application Support")
         : Option.getOrElse(config.xdgConfigHome, () => path.join(homeDirectory, ".config"));
+  const rootDir = path.resolve(input.dirname, "../../..");
+  const appRoot = input.isPackaged ? input.appPath : rootDir;
+  const profile = resolveDesktopProfile({
+    isPackaged: input.isPackaged,
+    packageJsonPath: path.join(appRoot, "package.json"),
+  });
   const baseDir = resolveDesktopBaseDir({
     homeDirectory,
     joinPath: path.join,
     t3Home: config.t3Home,
+    ...(profile === undefined ? {} : { profile }),
   });
-  const rootDir = path.resolve(input.dirname, "../../..");
-  const appRoot = input.isPackaged ? input.appPath : rootDir;
   const serverRoot =
     input.isPackaged && input.platform === "win32"
       ? path.join(input.resourcesPath, "server.asar")
@@ -180,6 +241,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
   const branding = resolveDesktopAppBranding({
     isDevelopment,
     appVersion: input.appVersion,
+    ...(profile === undefined ? {} : { profile }),
   });
   const displayName = branding.displayName;
   const stateDir = resolveDesktopStateDir({
@@ -188,8 +250,16 @@ const make = Effect.fn("desktop.environment.make")(function* (
     joinPath: path.join,
     t3Home: config.t3Home,
   });
-  const userDataDirName = isDevelopment ? "t3code-dev" : "t3code";
-  const legacyUserDataDirName = isDevelopment ? "T3 Code (Dev)" : "T3 Code (Alpha)";
+  const userDataDirName = isDevelopment
+    ? "t3code-dev"
+    : profile === "work"
+      ? "t3code-work"
+      : "t3code";
+  const legacyUserDataDirName = isDevelopment
+    ? "T3 Code (Dev)"
+    : profile === "work"
+      ? "T3 Code (Work)"
+      : "T3 Code (Alpha)";
   const linuxApplicationsDir = path.join(
     Option.getOrElse(config.xdgDataHome, () => path.join(homeDirectory, ".local", "share")),
     "applications",
@@ -246,6 +316,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     linuxWmClass: isDevelopment ? "t3code-dev" : "t3code",
     linuxApplicationsDir,
     appImagePath: config.appImagePath,
+    profile,
     userDataDirName,
     legacyUserDataDirName,
     defaultDesktopSettings: DesktopAppSettings.resolveDefaultDesktopSettings(input.appVersion),

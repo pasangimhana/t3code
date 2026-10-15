@@ -169,6 +169,34 @@ quit_app() {
   fail "$app_name is still open. Quit it and run update.sh again."
 }
 
+# Local preview builds are unsigned, and macOS ties TCC permissions (Screen
+# Recording, Accessibility, ...) to the app's code signature. An unsigned app
+# gets a new effective identity on every rebuild, so macOS drops the grants and
+# re-prompts after each update. Signing the staged app with a stable local
+# certificate keeps the designated requirement (bundle id + certificate) the
+# same across updates, so permissions survive.
+resolve_sign_identity() {
+  if [[ -n "${T3CODE_LOCAL_SIGN_IDENTITY:-}" ]]; then
+    printf '%s' "$T3CODE_LOCAL_SIGN_IDENTITY"
+    return 0
+  fi
+  security find-identity -p codesigning 2>/dev/null |
+    sed -n 's/.*"\(T3 Code Local Signing\)".*/\1/p' | head -n 1 || true
+}
+
+sign_app() {
+  local app_path="$1"
+  local identity
+  identity="$(resolve_sign_identity)"
+  if [[ -z "$identity" ]]; then
+    printf 'warning: no "T3 Code Local Signing" codesigning identity; %s stays unsigned and macOS permissions will reset on the next update.\n' "$(basename "$app_path")" >&2
+    return 0
+  fi
+  xattr -dr com.apple.quarantine "$app_path" 2>/dev/null || true
+  codesign --force --deep --sign "$identity" "$app_path"
+  codesign --verify --strict "$app_path"
+}
+
 last_backup_path=""
 
 # Mount the DMG, ditto the app into a staging path in /Applications, verify the
@@ -201,6 +229,8 @@ install_app() {
     fail "The $app_name build has an unexpected bundle identifier."
   [[ ! -e "$staged_app/Contents/Resources/app-update.yml" ]] ||
     fail "The local preview build for $app_name unexpectedly contains an auto-update feed."
+
+  sign_app "$staged_app"
 
   hdiutil detach "$mount_path" -quiet
 

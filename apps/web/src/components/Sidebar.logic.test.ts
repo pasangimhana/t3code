@@ -9,6 +9,7 @@ import {
   buildBulkTitleRegenerationContextMenuItem,
   buildBulkUnpinContextMenuItem,
   buildMultiSelectThreadContextMenuItems,
+  buildProjectContextMenuItems,
   createThreadJumpHintVisibilityController,
   deleteSelectedThreadEntries,
   filterSidebarProjectScopeItems,
@@ -334,6 +335,44 @@ describe("buildMultiSelectThreadContextMenuItems", () => {
     expect(
       buildMultiSelectThreadContextMenuItems({ count: 2, hasRunningThread: true }),
     ).toContainEqual({ id: "archive", label: "Archive (2)", disabled: true });
+  });
+});
+
+describe("buildProjectContextMenuItems", () => {
+  it("offers a single destructive remove when the group has one checkout", () => {
+    const items = buildProjectContextMenuItems({
+      members: [{ physicalProjectKey: "local:p1", label: "/Users/me/project" }],
+    });
+
+    expect(items).toContainEqual({
+      id: "remove-project",
+      label: "Remove project",
+      icon: "trash",
+      separatorBefore: true,
+      destructive: true,
+    });
+    expect(items).toContainEqual({ id: "copy-path", label: "Copy path", icon: "copy" });
+  });
+
+  it("nests one destructive remove per checkout for grouped projects", () => {
+    const items = buildProjectContextMenuItems({
+      members: [
+        { physicalProjectKey: "local:p1", label: "Local" },
+        { physicalProjectKey: "remote:p2", label: "Remote" },
+      ],
+    });
+
+    expect(items).toContainEqual({
+      id: "remove-project",
+      label: "Remove project",
+      icon: "trash",
+      separatorBefore: true,
+      children: [
+        { id: "remove-project:local:p1", label: "Local", destructive: true },
+        { id: "remove-project:remote:p2", label: "Remote", destructive: true },
+      ],
+    });
+    expect(items.some((item) => item.id === "copy-path")).toBe(false);
   });
 });
 

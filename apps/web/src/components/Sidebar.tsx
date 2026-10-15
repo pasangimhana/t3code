@@ -57,6 +57,7 @@ import {
   FolderIcon,
   GitBranchIcon,
   MessageCircleQuestionIcon,
+  MoreHorizontalIcon,
   PinIcon,
   PinOffIcon,
   PlusIcon,
@@ -105,7 +106,10 @@ import { isModelPickerOpen } from "../modelPickerVisibility";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { isMacPlatform } from "~/lib/utils";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
-import { releaseComposerDraftUploads } from "../lib/composerDraftUploads";
+import {
+  releaseComposerDraftUploads,
+  releaseProjectDraftUploads,
+} from "../lib/composerDraftUploads";
 import { readLocalApi } from "../localApi";
 import {
   isSameSidebarThreadRef,
@@ -115,6 +119,7 @@ import { getProjectOrderKey, selectProjectGroupingSettings } from "../logicalPro
 import {
   buildSidebarProjectSnapshots,
   projectGroupsSpanEnvironments,
+  type SidebarProjectGroupMember,
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
 import {
@@ -141,6 +146,7 @@ import {
   useProjects,
   useThreadShells,
 } from "../state/entities";
+import { projectEnvironment } from "../state/projects";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
@@ -164,6 +170,7 @@ import {
   applySidebarThreadDrop,
   buildBulkTitleRegenerationContextMenuItem,
   buildBulkUnpinContextMenuItem,
+  buildProjectContextMenuItems,
   deleteSelectedThreadEntries,
   filterSidebarProjectScopeItems,
   formatWorkingDurationLabel,
@@ -2343,6 +2350,7 @@ export default function Sidebar() {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
+  const deleteProject = useAtomCommand(projectEnvironment.delete, { reportFailure: false });
   const { copyToClipboard: copyPathToClipboard } = useCopyToClipboard<{ path: string }>({
     onCopy: ({ path }) => {
       toastManager.add({
@@ -4333,6 +4341,120 @@ export default function Sidebar() {
     ],
   );
 
+  const removeProjectMember = useCallback(
+    async (member: SidebarProjectGroupMember) => {
+      const api = readLocalApi();
+      if (!api) return;
+      const memberThreads = threads.filter(
+        (thread) => thread.environmentId === member.environmentId && thread.projectId === member.id,
+      );
+      const confirmed = await settlePromise(() =>
+        api.dialogs.confirm(
+          [
+            memberThreads.length > 0
+              ? `Remove project "${member.title}" and delete its ${memberThreads.length} thread${
+                  memberThreads.length === 1 ? "" : "s"
+                }?`
+              : `Remove project "${member.title}"?`,
+            `Path: ${member.workspaceRoot}`,
+            ...(member.environmentLabel ? [`Environment: ${member.environmentLabel}`] : []),
+            ...(memberThreads.length > 0
+              ? [
+                  "This permanently clears conversation history for those threads and any archived threads.",
+                ]
+              : ["This permanently clears any archived conversation history."]),
+            "This removes only the project entry, not the files on disk.",
+            "This action cannot be undone.",
+          ].join("\n"),
+          { variant: "destructive" },
+        ),
+      );
+      if (confirmed._tag === "Failure" || !confirmed.value) return;
+      const result = await deleteProject({
+        environmentId: member.environmentId,
+        input: { projectId: member.id, force: true },
+      });
+      if (result._tag === "Failure") {
+        if (isAtomCommandInterrupted(result)) return;
+        const error = squashAtomCommandFailure(result);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: `Failed to remove "${member.title}"`,
+            description: error instanceof Error ? error.message : "An error occurred.",
+          }),
+        );
+        return;
+      }
+      const projectRef = scopeProjectRef(member.environmentId, member.id);
+      releaseProjectDraftUploads(
+        projectRef,
+        memberThreads.map((thread) => scopeThreadRef(thread.environmentId, thread.id)),
+      );
+      const draftStore = useComposerDraftStore.getState();
+      const projectDraftThread = draftStore.getDraftThreadByProjectRef(projectRef);
+      if (projectDraftThread) draftStore.clearDraftThread(projectDraftThread.draftId);
+      draftStore.clearProjectDraftThreadId(projectRef);
+      // A route pointing at the deleted project would render a dead thread.
+      const routeThread =
+        routeThreadRef === null
+          ? null
+          : (threadByKeyRef.current.get(scopedThreadKey(routeThreadRef)) ?? null);
+      const viewingRemovedProject =
+        (routeThread?.environmentId === member.environmentId &&
+          routeThread.projectId === member.id) ||
+        (routeDraftThread?.environmentId === member.environmentId &&
+          routeDraftThread.projectId === member.id);
+      if (viewingRemovedProject) {
+        void router.navigate({ to: "/", replace: true });
+      }
+    },
+    [deleteProject, routeDraftThread, routeThreadRef, router, threads],
+  );
+
+  const handleProjectContextMenu = useCallback(
+    (projectGroup: SidebarProjectSnapshot, position: { x: number; y: number }) => {
+      void (async () => {
+        const api = readLocalApi();
+        if (!api) return;
+        const members = projectGroup.memberProjects;
+        const clicked = await api.contextMenu.show(
+          buildProjectContextMenuItems({
+            members: members.map((member) => ({
+              physicalProjectKey: member.physicalProjectKey,
+              label: member.environmentLabel ?? member.workspaceRoot,
+            })),
+          }),
+          position,
+        );
+        if (!clicked) return;
+        if (clicked === "new-thread") {
+          void handleNewThreadRef.current(
+            scopeProjectRef(projectGroup.environmentId, projectGroup.id),
+          );
+          return;
+        }
+        if (clicked === "project-settings") {
+          openProjectSettings(projectGroup);
+          return;
+        }
+        if (clicked === "copy-path") {
+          const member = members[0];
+          if (member) copyPathToClipboard(member.workspaceRoot, { path: member.workspaceRoot });
+          return;
+        }
+        const member =
+          clicked === "remove-project"
+            ? members[0]
+            : members.find(
+                (candidate) => `remove-project:${candidate.physicalProjectKey}` === clicked,
+              );
+        if (member) await removeProjectMember(member);
+      })();
+    },
+    [copyPathToClipboard, openProjectSettings, removeProjectMember],
+  );
+
   const handleThreadContextMenu = useCallback(
     (threadRef: ScopedThreadRef, position: { x: number; y: number }) => {
       void (async () => {
@@ -5177,7 +5299,16 @@ export default function Sidebar() {
                           items.push(
                             <SortableSidebarProjectItem key={item.key} item={item}>
                               {project ? (
-                                <div className="flex h-8 w-full items-center gap-1 rounded-md px-2.5 text-sm font-medium text-sidebar-foreground/85 hover:bg-sidebar-row-hover">
+                                <div
+                                  className="flex h-8 w-full items-center gap-1 rounded-md px-2.5 text-sm font-medium text-sidebar-foreground/85 hover:bg-sidebar-row-hover"
+                                  onContextMenu={(event) => {
+                                    event.preventDefault();
+                                    handleProjectContextMenu(project, {
+                                      x: event.clientX,
+                                      y: event.clientY,
+                                    });
+                                  }}
+                                >
                                   <button
                                     type="button"
                                     aria-label={`${item.title} project`}
@@ -5212,6 +5343,25 @@ export default function Sidebar() {
                                     }}
                                   >
                                     <PlusIcon aria-hidden className="size-3.5" />
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="icon-xs"
+                                    variant="ghost-muted"
+                                    aria-label={`More actions for ${item.title}`}
+                                    title={`More actions for ${item.title}`}
+                                    data-thread-selection-safe
+                                    onPointerDown={(event) => event.stopPropagation()}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      const rect = event.currentTarget.getBoundingClientRect();
+                                      handleProjectContextMenu(project, {
+                                        x: rect.right,
+                                        y: rect.bottom,
+                                      });
+                                    }}
+                                  >
+                                    <MoreHorizontalIcon aria-hidden className="size-3.5" />
                                   </Button>
                                 </div>
                               ) : (

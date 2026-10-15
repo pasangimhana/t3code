@@ -536,6 +536,53 @@ export function buildMultiSelectThreadContextMenuItems(input: {
   ];
 }
 
+export type ProjectContextMenuAction =
+  | "new-thread"
+  | "project-settings"
+  | "copy-path"
+  | "remove-project"
+  | `remove-project:${string}`;
+
+/**
+ * Project-row actions. A group with a single checkout removes it directly;
+ * a group spanning several checkouts nests one destructive item per checkout
+ * so it is unambiguous which machine loses its project entry.
+ */
+export function buildProjectContextMenuItems(input: {
+  members: ReadonlyArray<{ physicalProjectKey: string; label: string }>;
+}): readonly ContextMenuItem<ProjectContextMenuAction>[] {
+  const { members } = input;
+  const singleMember = members.length === 1 ? members[0]! : null;
+  const removeItem: ContextMenuItem<ProjectContextMenuAction> =
+    singleMember !== null
+      ? {
+          id: "remove-project",
+          label: "Remove project",
+          icon: "trash",
+          separatorBefore: true,
+          destructive: true,
+        }
+      : {
+          id: "remove-project",
+          label: "Remove project",
+          icon: "trash",
+          separatorBefore: true,
+          children: members.map((member) => ({
+            id: `remove-project:${member.physicalProjectKey}`,
+            label: member.label,
+            destructive: true,
+          })),
+        };
+  return [
+    { id: "new-thread", label: "New thread", icon: "message-square-plus" },
+    { id: "project-settings", label: "Project settings", icon: "settings" },
+    ...(singleMember !== null
+      ? [{ id: "copy-path", label: "Copy path", icon: "copy" } as const]
+      : []),
+    removeItem,
+  ];
+}
+
 export function buildBulkTitleRegenerationContextMenuItem(input: {
   supportedCount: number;
   actionableCount: number;

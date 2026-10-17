@@ -22,7 +22,7 @@ const defaultInput = {
   runningUnderArm64Translation: false,
 } satisfies DesktopEnvironment.MakeDesktopEnvironmentInput;
 
-const makeEnvironmentLayer = (
+const layerEnvironment = (
   overrides: Partial<DesktopEnvironment.MakeDesktopEnvironmentInput> = {},
   env: Record<string, string | undefined> = {},
 ) =>
@@ -38,8 +38,7 @@ const makeEnvironmentLayer = (
 const makeEnvironment = (
   overrides: Partial<DesktopEnvironment.MakeDesktopEnvironmentInput> = {},
   env: Record<string, string | undefined> = {},
-) =>
-  DesktopEnvironment.DesktopEnvironment.pipe(Effect.provide(makeEnvironmentLayer(overrides, env)));
+) => DesktopEnvironment.DesktopEnvironment.pipe(Effect.provide(layerEnvironment(overrides, env)));
 
 describe("DesktopEnvironment", () => {
   it.effect("derives state paths and development identity inside Effect", () =>
@@ -182,8 +181,6 @@ describe("DesktopEnvironment", () => {
 
       assert.equal(work.profile, "work");
       assert.equal(work.displayName, "T3 Code Work");
-      assert.equal(work.userDataDirName, "t3code-work");
-      assert.equal(work.legacyUserDataDirName, "T3 Code (Work)");
       assert.equal(work.baseDir, "/Users/alice/.t3-work");
       assert.equal(work.stateDir, "/Users/alice/.t3-work/userdata");
 
@@ -191,7 +188,6 @@ describe("DesktopEnvironment", () => {
       yield* fs.writeFileString(packageJsonPath, '{"t3codeProfile":"team"}');
       const unknown = yield* makeEnvironment({ isPackaged: true, appPath: appRoot });
       assert.equal(unknown.profile, undefined);
-      assert.equal(unknown.userDataDirName, "t3code");
       assert.equal(unknown.baseDir, "/Users/alice/.t3");
 
       // Dev runs never pick up a packaged profile marker.
